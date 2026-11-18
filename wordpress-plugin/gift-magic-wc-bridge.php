@@ -216,9 +216,14 @@ function gift_magic_create_woo_order(WP_REST_Request $request) {
     : ($deliveryZone === 'outside' ? 'ঢাকার বাইরে' : 'ঢাকা');
 
   try {
-    $order = wc_create_order();
-    $order->set_created_via('gift-magic-landing');
+    if (function_exists('wc_load_cart') && function_exists('WC') && WC() && !WC()->cart) {
+      wc_load_cart();
+    }
+
+    $order = new WC_Order();
+    $order->set_created_via('checkout');
     $order->set_currency('BDT');
+    $order->set_status('pending');
 
     $configured_product_id = absint(get_option('gift_magic_wc_product_id', 0));
     $product               = $configured_product_id > 0 ? wc_get_product($configured_product_id) : null;
@@ -251,7 +256,6 @@ function gift_magic_create_woo_order(WP_REST_Request $request) {
           $line_item->set_name($packageName);
           $line_item->set_subtotal($unitPrice * $quantity);
           $line_item->set_total($unitPrice * $quantity);
-          $line_item->save();
           $added_item = true;
         }
       }
@@ -286,8 +290,45 @@ function gift_magic_create_woo_order(WP_REST_Request $request) {
     $order->set_payment_method('cod');
     $order->set_payment_method_title('Cash on Delivery');
     $order->calculate_totals();
-    $order->update_status('processing', 'Gift Magic Landing Page থেকে নতুন অর্ডার এসেছে।');
-    $order->save();
+
+    // Save first with complete billing + items so woocommerce_new_order receives full data
+    $order_id = $order->save();
+
+    $posted_data = [
+      'billing_first_name'  => $first_name,
+      'billing_last_name'   => $last_name,
+      'billing_address_1'   => $address,
+      'billing_city'        => $city,
+      'billing_country'     => 'BD',
+      'billing_phone'       => $phone,
+      'shipping_first_name' => $first_name,
+      'shipping_last_name'  => $last_name,
+      'shipping_address_1'  => $address,
+      'shipping_city'       => $city,
+      'shipping_country'    => 'BD',
+      'payment_method'      => 'cod',
+    ];
+
+    // Trigger native checkout lifecycle hooks so AFI (Google Sheets) & courier/sync plugins fire cleanly
+    $ob_level = ob_get_level();
+    ob_start();
+    try {
+      try {
+        do_action('woocommerce_checkout_order_processed', $order_id, $posted_data, $order);
+      } catch (Throwable $hook_err) {
+      }
+
+      $order->update_status('processing', 'Gift Magic Landing Page থেকে নতুন অর্ডার এসেছে।', true);
+
+      try {
+        do_action('woocommerce_thankyou', $order_id);
+      } catch (Throwable $hook_err) {
+      }
+    } finally {
+      while (ob_get_level() > $ob_level) {
+        ob_end_clean();
+      }
+    }
 
     delete_transient('gift_magic_recent_orders_v1');
 
